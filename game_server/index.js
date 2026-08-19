@@ -1,6 +1,6 @@
 // Prendo le librerie
 const express    = require('express'  );   // Crea l'applicazione web (gestisce HTTP)
-const http       = require('http'     );   
+const http       = require('http'     );
 const { Server } = require('socket.io');
 
 // Gestisco il server
@@ -14,268 +14,427 @@ const ARENA_HEIGHT     = 720 ;
 const LOBBY_DURATION   = 30  ; // secondi di attesa iscrizioni
 const MATCH_DURATION   = 180 ; // secondi di partita (3 minuti)
 const RESULTS_DURATION = 10  ; // secondi mostra podio
+const MAX_PLAYERS      = 100 ; // numero dei giocatori
 
-const PHASES = {LOBBY  : 'LOBBY'  ,
-                PLAYING: 'PLAYING',
-                RESULTS: 'RESULTS'};
+let currentArenaMarginX = 0;
+let currentArenaMarginY = 0;
+
+const PHASES        = {LOBBY  : 'LOBBY'  ,
+                       PLAYING: 'PLAYING',
+                       RESULTS: 'RESULTS'};
 
 // Mappa regalo -> effetto power-up (personalizza con gli ID veri di TikTok/YouTube)
-const GIFT_EFFECTS = {rose  : {type: 'SPEED_BOOST', duration: 10},
-                      lion  : {type: 'SIZE_UP'    , duration: 15},
-                      galaxy: {type: 'EXTRA_LIFE' , duration: 0 }};
+const GIFT_EFFECTS  = {rose  : {type: 'SPEED_BOOST', duration: 10},
+                       lion  : {type: 'SIZE_UP'    , duration: 15},
+                       galaxy: {type: 'EXTRA_LIFE' , duration: 0 }};
 
-// ======================= STATO GLOBALE =======================
-let state = {phase      : PHASES.LOBBY  ,
-             timer      : LOBBY_DURATION,
-             players    : new Map()     ,  // userId -> playerObject
-             leaderboard: {}            }; // userId -> vittorie totali
+let state           = {phase      : PHASES.LOBBY  ,
+                       timer      : LOBBY_DURATION,
+                       leaderboard: {}            }; // userId -> vittorie totali
+
+// Restituisce un player vuoto
+function createEmptyPlayer() {
+    return {active         : false,  // true = slot occupato da un giocatore reale
+            userId         : null ,
+            username       : null ,
+            avatarUrl      : null ,
+            x              : 0    ,
+            y              : 0    ,
+            vx             : 0    ,
+            vy             : 0    ,
+            size           : 20   ,
+            lives          : 1    ,
+            alive          : false,
+            speedMultiplier: 1    ,
+            powerUps       : []   };
+}
+
+// Inizializzo array di 100 player
+const players = [];
+for (let i = 0; i < MAX_PLAYERS; i++) {
+    players[i] = createEmptyPlayer();
+}
+
 
 // ======================= STATE MACHINE =======================
+// Viene chiamata ogni secondo
 function tick() {
     state.timer = state.timer - 1;
 
     switch (state.phase) {
+
+        // ---------------- STATO: LOBBY ----------------
         case PHASES.LOBBY:
-            if (state.timer <= 0)
-                startMatch();
+            if (state.timer <= 0) {
+                // Conto quanti giocatori si sono iscritti
+                let activeCount = 0;
+                for (let i = 0; i < players.length; i++) {
+                    if (players[i].active) {
+                        activeCount = activeCount + 1;
+                    }
+                }
+
+                if (activeCount === 0) {
+                    // Nessuno iscritto: rimango in LOBBY, ricarico il timer
+                    state.timer         = LOBBY_DURATION;
+                    state.phase         = PHASES.LOBBY;
+                } else {
+                    // Transizione LOBBY -> PLAYING
+                    state.phase         = PHASES.PLAYING;
+                    state.timer         = MATCH_DURATION;
+                    currentArenaMarginX = 0;
+                    currentArenaMarginY = 0;
+                    console.log(`Partita iniziata con ${activeCount} giocatori`);
+                }
+            }
             break;
 
+        // ---------------- STATO: PLAYING ----------------
         case PHASES.PLAYING:
             updatePhysics();
-            if (checkWinCondition() || state.timer <= 0)
-                endMatch();
+
+            if (checkWinCondition() || state.timer <= 0) {
+                // Cerco il vincitore: primo slot attivo e ancora vivo
+                let winner = null;
+                for (let i = 0; i < players.length; i++) {
+                    if (players[i].active && players[i].alive) {
+                        winner = players[i];
+                        break;
+                    }
+                }
+
+                // Se nessuno è sopravvissuto, prendo il primo slot ancora attivo trovato
+                if (winner === null) {
+                    for (let i = 0; i < players.length; i++) {
+                        if (players[i].active) {
+                            winner = players[i];
+                            break;
+                        }
+                    }
+                }
+
+                if (winner !== null) {
+                    state.leaderboard[winner.userId] = (state.leaderboard[winner.userId] || 0) + 1;
+                }
+
+                // Transizione PLAYING -> RESULTS
+                state.phase = PHASES.RESULTS;
+                state.timer = RESULTS_DURATION;
+                io.emit('match_ended', { winner: winner, leaderboard: state.leaderboard });
+                console.log(`Partita finita. Vincitore: ${winner ? winner.username : 'nessuno'}`);
+            }
             break;
 
+        // ---------------- STATO: RESULTS ----------------
         case PHASES.RESULTS:
-            if (state.timer <= 0)
-                resetMatch();
+            if (state.timer <= 0) {
+                // Libero tutti gli slot occupati, il pool resta sempre di MAX_PLAYERS elementi
+                for (let i = 0; i < players.length; i++) {
+                    players[i].active = false;
+                    players[i].userId = null;
+                    players[i].alive  = false;
+                }
+                // Transizione RESULTS -> LOBBY
+                state.phase = PHASES.LOBBY;
+                state.timer = LOBBY_DURATION;
+            }
             break;
     }
 
+    // Ogni secondo
     io.emit('state_update', serializeState());
 }
 
-function startMatch() {
-    // Nessuno si è iscritto: resta in lobby ancora un po'
-    if (state.players.size === 0) {
-      state.timer = LOBBY_DURATION;
-      return;
+
+function checkWinCondition() {
+    // Conto quanti slot sono occupati (active) e quanti tra questi sono ancora vivi (alive)
+    let activeCount = 0;
+    let aliveCount  = 0;
+
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].active) {
+            activeCount = activeCount + 1;
+
+            if (players[i].alive) {
+                aliveCount = aliveCount + 1;
+            }
+        }
     }
 
-    state.phase = PHASES.PLAYING;
-    state.timer = MATCH_DURATION;
-    currentArenaMargin = 0;
-    console.log(`Partita iniziata con ${state.players.size} giocatori`);
+    // La partita finisce quando c'erano almeno 2 iscritti ma ne è rimasto vivo al massimo 1
+    return activeCount > 1 && aliveCount <= 1;
 }
-
-function endMatch() {
-    const winner = computeWinner();
-    if (winner) {
-        state.leaderboard[winner.userId] = (state.leaderboard[winner.userId] || 0) + 1;
-    }
-    state.phase = PHASES.RESULTS;
-    state.timer = RESULTS_DURATION;
-    io.emit('match_ended', { winner, leaderboard: state.leaderboard });
-    console.log(`Partita finita. Vincitore: ${winner ? winner.username : 'nessuno'}`);
-}
-
-function resetMatch() {
-  state.players.clear();
-  state.phase = PHASES.LOBBY;
-  state.timer = LOBBY_DURATION;
-}
-
-
 
 function serializeState() {
-    return {phase      : state.phase                       ,
-            timer      : state.timer                       ,
-            arenaMargin: currentArenaMargin                ,
-            players    : Array.from(state.players.values())};
-}
-
-
-
-//----------------------------------------------------------------------------------
-// Utile per riempire la chiave userId con i dati effettivi del giocatore
-//----------------------------------------------------------------------------------
-function createPlayer (userId, username, avatarUrl) {
-    return {userId                                              ,
-            username                                            ,
-            avatarUrl                                           ,
-            x        : Math.random() * (ARENA_WIDTH  - 100) + 50,
-            y        : Math.random() * (ARENA_HEIGHT - 100) + 50,
-            vx       : 0                                        ,
-            vy       : 0                                        ,
-            size     : 20                                       ,
-            lives    : 1                                        ,
-            alive    : true                                     ,
-            powerUps : []                                       };
-}
-
-//----------------------------------------------------------------------------------
-// Permette di gestire la creazione del giocatore
-//
-// Se la chat scrive "JOIN" devo:
-// 1: verificare che mi trovo nella lobby
-// 2: sa mi trovo nella lobby, il palyer non deve esistere per essere creato
-//
-// Se viene effettuato un altro comando, devo vedere se il player esiste, è vivo o sta giocando:
-// 1: il player esegue il comando
-//----------------------------------------------------------------------------------
-function handleCommand ({userId, username, avatarUrl, command}) {
-
-    if (command === 'JOIN') {
-        // Il giocatore può entrare solo se sto in lobby, altrimenti termino la funzione
-        if (state.phase !== PHASES.LOBBY)
-            return;
-
-        // Se sto in lobby, controllo che il giocatore sia nuovo prima lo inserisco
-        if (!state.players.has(userId)) {
-            state.players.set(userId, createPlayer(userId, username, avatarUrl));
-            console.log(`${username} è entrato in partita`);
+    // Costruisco l'elenco dei soli giocatori attivi, così il frontend riceve solo i dati necessari
+    let activePlayers = [];
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].active) {
+            activePlayers.push(players[i]);
         }
-        return;
     }
 
-
-    const player = state.players.get(userId);
-    if (!player || !player.alive || state.phase !== PHASES.PLAYING) 
-        return;
-
-    const SPEED = 4;
-    if (command === 'LEFT' ) player.vx = -SPEED;
-    if (command === 'RIGHT') player.vx =  SPEED;
-    if (command === 'UP'   ) player.vy = -SPEED;
-    if (command === 'DOWN' ) player.vy =  SPEED;
-    if (command === 'BOOST') applyPowerUp(player, {type:'SPEED_BOOST', duration: 3});
+    return {
+        phase       : state.phase,
+        timer       : state.timer,
+        arenaMarginX: currentArenaMarginX,
+        arenaMarginY: currentArenaMarginY,
+        players     : activePlayers  // mando al frontend solo gli slot occupati
+    };
 }
 
-//----------------------------------------------------------------------------------
-// Controlla quale regalo assegnare se:
-// 1: il player esiste
-// 2: se esiste, gli assegno il regalo
-//----------------------------------------------------------------------------------
-function handleGift({userId, giftId}) {
-    const player = state.players.get(userId);
-    if (!player)
-        return;
-
-    const effect = GIFT_EFFECTS[giftId];
-    if (!effect)
-        return;
-
-    applyPowerUp(player, effect);
-    console.log(`${player.username} ha ricevuto power-up: ${effect.type}`);
-}
-
-//----------------------------------------------------------------------------------
-function applyPowerUp(player, effect) {
-    if (effect.type === 'SIZE_UP'    ) player.size            = 40;
-    if (effect.type === 'EXTRA_LIFE' ) player.lives          += 1 ;
-    if (effect.type === 'SPEED_BOOST') player.speedMultiplier = 2 ;
-
-    player.powerUps.push({ ...effect, expiresAt: Date.now() + effect.duration * 1000 });
-}
-//----------------------------------------------------------------------------------
-
-function expirePowerUps(player) {
-    const now = Date.now();
-    player.powerUps = player.powerUps.filter(p => {
-        if (p.expiresAt <= now) {
-            if (p.type === 'SIZE_UP'    ) player.size            = 20;
-            if (p.type === 'SPEED_BOOST') player.speedMultiplier = 1 ;
-            return false;
+// ======================= GESTIONE COMANDI DALLA CHAT =======================
+//----------------------------------------------------------------------------
+//---------------------       Funzioni di supporto       ---------------------
+//----------------------------------------------------------------------------
+// Cerca uno slot già occupato da userId
+function findPlayerById(userId) {
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].active && players[i].userId === userId) {
+            return players[i];
         }
-        return true;
-    });
+    }
+    return undefined; // nessuno trovato
+}
+
+// Trova il primo slot non occupato
+function findFreeSlot() {
+    for (let i = 0; i < players.length; i++) {
+        if (!players[i].active) {
+            return players[i];
+        }
+    }
+    return undefined; // nessuno slot libero
+}
+
+// "Attiva" uno slot libero riempiendolo con i dati del nuovo giocatore
+function activatePlayer(slot, userId, username, avatarUrl) {
+    slot.active          = true;
+    slot.userId          = userId;
+    slot.username        = username;
+    slot.avatarUrl       = avatarUrl;
+    slot.x               = Math.random() * (ARENA_WIDTH  - 100) + 50;
+    slot.y               = Math.random() * (ARENA_HEIGHT - 100) + 50;
+    slot.vx              = 0;
+    slot.vy              = 0;
+    slot.size            = 20;
+    slot.lives           = 1;
+    slot.alive           = true;
+    slot.speedMultiplier = 1;
+    slot.powerUps        = [];
+}
+
+// "Libera" uno slot: torna disponibile per un futuro giocatore
+function deactivatePlayer(slot) {
+    slot.active = false;
+    slot.userId = null;
+    slot.alive  = false;
+}
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+
+function handleCommand({ userId, username, avatarUrl, command }) {
+
+    // ---- Comando JOIN: valido SOLO in fase LOBBY ----
+    if (command === 'JOIN' && state.phase === PHASES.LOBBY) {
+
+        // Se il player non esiste lo creo
+        if (!findPlayerById(userId)) {
+            const slot = findFreeSlot(); // Individuo la prima posizione non occupata (passaggio per riferimento)
+
+            if (!slot) {
+                // Spazio esaurito: nessuno slot libero su MAX_PLAYERS
+                console.log('Pool pieno: nessuno slot libero (100/100)');
+                return;
+            } else {
+                // Slot trovato: attivo il giocatore
+                activatePlayer(slot, userId, username, avatarUrl);
+                console.log(`${username} è entrato in partita`);
+                return;
+            }
+        } else {
+            return; // Player già iscritto: ignoro il doppio JOIN
+        }
+
+    } else if (command !== 'JOIN') {
+        // ---- Ogni altro comando: valido SOLO in fase PLAYING, con player esistente e vivo ----
+        const player = findPlayerById(userId);
+
+        if (player && player.alive && state.phase === PHASES.PLAYING) {
+            const SPEED = 4;
+            if (command === 'LEFT' ) player.vx = -SPEED;
+            if (command === 'RIGHT') player.vx =  SPEED;
+            if (command === 'UP'   ) player.vy = -SPEED;
+            if (command === 'DOWN' ) player.vy =  SPEED;
+            if (command === 'BOOST') applyPowerUp(player, {type:'SPEED_BOOST', duration: 3});
+        } else {
+            return; // Player inesistente, eliminato, oppure siamo fuori dalla fase PLAYING: ignoro
+        }
+
+    } else {
+        return; // JOIN ricevuto ma fuori da LOBBY (PLAYING o RESULTS): iscrizioni chiuse, ignoro
+    }
+}
+
+
+
+function handleGift({ userId, giftId }) {
+
+    const player = findPlayerById(userId);
+    if (!player) {
+        // Nessuno slot attivo per questo userId: il regalo non ha un player a cui applicarsi
+        return;
+    } else {
+        const effect = GIFT_EFFECTS[giftId];
+
+        if (!effect) {
+            // giftId non mappato in GIFT_EFFECTS: regalo non riconosciuto, ignoro
+            return;
+        } else {
+
+            // ---- Applico l'effetto direttamente al player ----
+            if (effect.type === 'SIZE_UP'    ) player.size            = 40;
+            if (effect.type === 'EXTRA_LIFE' ) player.lives          += 1 ;
+            if (effect.type === 'SPEED_BOOST') player.speedMultiplier = 2 ;
+
+            // Registro il power-up con la sua scadenza, così expirePowerUps() potrà ripristinarlo
+            player.powerUps.push({type      : effect.type,
+                                  duration  : effect.duration,
+                                  expiresAt : Date.now() + effect.duration * 1000
+                                });
+
+            console.log(`${player.username} ha ricevuto power-up: ${effect.type}`);
+        }
+    }
 }
 
 
 // ======================= FISICA / LOGICA DI GIOCO =======================
 function updatePhysics() {
-    // Tra tutti i giocatori, prendo quelli vivi (p)
-    const players = Array.from(state.players.values()).filter(p => p.alive);
 
-    // Muovi ogni player: metto in mult il moltiplicatore di velocità attuale
-    players.forEach(p => {
-	    const mult = p.speedMultiplier || 1;
+    // ---- Costruisco l'elenco dei soli giocatori attivi e ancora vivi ----
+    let activePlayers = [];
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].active && players[i].alive) {
+            activePlayers.push(players[i]);
+        }
+    }
+
+    // ---- Aggiorno posizione, bordi arena e scadenza power-up di ognuno ----
+    for (let i = 0; i < activePlayers.length; i++) {
+        const p = activePlayers[i];
+
+        const mult = p.speedMultiplier || 1;
         p.x = p.x + p.vx * mult;
         p.y = p.y + p.vy * mult;
 
-        // Impedisco al giocatore di uscire dall'arena
+        // Impedisco al giocatore di uscire dai bordi fissi dell'arena
         p.x = Math.max(p.size, Math.min(ARENA_WIDTH  - p.size, p.x));
         p.y = Math.max(p.size, Math.min(ARENA_HEIGHT - p.size, p.y));
 
-        // Se il powerup è scaduto, ripristino l'effetto
-        expirePowerUps(p);
-    });
+        // ---- Scadenza power-up ----
+        const now = Date.now();
+        let stillActivePowerUps = [];
 
-    // Collisioni semplici: chi si scontra con uno più grande viene eliminato
-    // per ogni giocatore vivo a coppia
-    for (let i = 0; i < players.length; i++) {
-        for (let j = i + 1; j < players.length; j++) {
-            const a = players[i];
-            const b = players[j];
+        for (let k = 0; k < p.powerUps.length; k++) {
+            const powerUp = p.powerUps[k];
+
+            if (powerUp.expiresAt <= now) {
+                // Power-up scaduto: ripristino l'effetto, non lo tengo nell'elenco
+                if (powerUp.type === 'SIZE_UP'    ) p.size            = 20;
+                if (powerUp.type === 'SPEED_BOOST') p.speedMultiplier = 1 ;
+
+            } else {
+                // Power-up ancora attivo: lo mantengo
+                stillActivePowerUps.push(powerUp);
+            }
+        }
+
+        p.powerUps = stillActivePowerUps;
+    }
+
+    // ---- Collisioni: ogni coppia di giocatori attivi viene confrontata una sola volta ----
+    for (let i = 0; i < activePlayers.length; i++) {
+        for (let j = i + 1; j < activePlayers.length; j++) {
+            const a = activePlayers[i];
+            const b = activePlayers[j];
+
             const dist = Math.hypot(a.x - b.x, a.y - b.y);
-            // Se si toccano, li elimino
+
             if (dist < (a.size + b.size) / 1.5) {
-                eliminateSmaller(a, b);
+                // ---- Elimino il più piccolo ----
+                let loser;
+                if (a.size <= b.size) {
+                    loser = a;
+                } else {
+                    loser = b;
+                }
+
+                if (loser.lives > 1) {
+                    loser.lives = loser.lives - 1;
+                    loser.size  = 20;
+                } else {
+                    loser.alive = false; // lo slot resta 'active' ma non più 'alive' fino al reset
+                }
             }
         }
     }
 
-    // Restringimento arena progressivo
     shrinkArena();
 }
 
-//----------------------------------------------------------------------------------
-// Elimino il giocatore più piccolo quando si scontrano
-//----------------------------------------------------------------------------------
-function eliminateSmaller(a, b) {
-    // Prendo il più piccolo
-    const loser = a.size <= b.size ? a : b;
-    if (loser.lives > 1) {
-        loser.lives = loser.lives - 1; // Diminuisco le vite
-        loser.size  = 20;              // reset size dopo aver perso una vita
+
+function shrinkArena() {
+    if (state.phase === PHASES.PLAYING) {
+
+        const progress = 1 - (state.timer / MATCH_DURATION); // 0 all'inizio -> 1 a fine partita
+
+        currentArenaMarginX = progress * (ARENA_WIDTH  * 0.3);
+        currentArenaMarginY = progress * (ARENA_HEIGHT * 0.3);
+
+        // ---- Controllo ogni giocatore attivo e vivo: se è fuori dai nuovi bordi, lo elimino ----
+        for (let i = 0; i < players.length; i++) {
+            const p = players[i];
+
+            if (!p.active || !p.alive) {
+                // Slot vuoto o giocatore già eliminato: salto al successivo
+                continue;
+            } else {
+
+                const fuoriX = p.x < currentArenaMarginX || p.x > ARENA_WIDTH  - currentArenaMarginX;
+                const fuoriY = p.y < currentArenaMarginY || p.y > ARENA_HEIGHT - currentArenaMarginY;
+
+                if (fuoriX || fuoriY) {
+                    p.alive = false;
+                }
+            }
+        }
     } else {
-        loser.alive = false;
+        return; // fuori dalla fase PLAYING l'arena non si restringe
     }
 }
 
-//----------------------------------------------------------------------------------
-// Rimpicciolisco l'arena se sto in fase di gioco
-//----------------------------------------------------------------------------------
-let currentArenaMargin = 0;
-function shrinkArena() {
-    if (state.phase !== PHASES.PLAYING)
-        return;
-
-    const progress = 1 - (state.timer / MATCH_DURATION); // 0 -> 1 nel tempo
-    currentArenaMargin = progress * (ARENA_WIDTH * 0.3);
-
-    state.players.forEach(p => {
-        if (p.alive && (p.x < currentArenaMargin || p.x > ARENA_WIDTH - currentArenaMargin)) {
-            p.alive = false; // fuori dai bordi ristretti = eliminato
-        }
-    });
-}
-
-//----------------------------------------------------------------------------------
-// Controllo che ci sia il vincitore
-//----------------------------------------------------------------------------------
-function checkWinCondition() {
-    const alive = Array.from(state.players.values()).filter(p => p.alive);
-    return state.players.size > 1 && alive.length <= 1;
-}
 
 function computeWinner() {
-    const alive = Array.from(state.players.values()).filter(p => p.alive);
-    if (alive.length > 0) return alive[0];
-    // Se nessuno è sopravvissuto (raro), vince chi ha resistito di più (già eliminato per ultimo)
-    return Array.from(state.players.values())[0] || null;
-}
+    // Primo tentativo: cerco il primo slot che sia sia active che alive
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].active && players[i].alive) {
+            return players[i];
+        }
+    }
 
+    // Se nessuno è sopravvissuto, prendo comunque il primo slot ancora active
+    // (caso raro: tutti eliminati nello stesso istante)
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].active) {
+            return players[i];
+        }
+    }
+
+    // Nessuno slot occupato: non c'è nessun vincitore possibile
+    return null;
+}
 
 
 
@@ -292,7 +451,7 @@ io.on('connection', (socket) => {
     socket.on('player_gift'   , handleGift);
 
     socket.on('disconnect', () => {
-    console.log('Client disconnesso:', socket.id);
+        console.log('Client disconnesso:', socket.id);
     });
 });
 
@@ -300,5 +459,5 @@ io.on('connection', (socket) => {
 setInterval(tick, 1000);
 
 server.listen(4000, () => {
-  console.log('Game server attivo su porta 4000');
+    console.log('Game server attivo su porta 4000');
 });

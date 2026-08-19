@@ -1,0 +1,78 @@
+=========================================
+              GUIDA RAPIDA
+=========================================
+
+--------------------------------------
+1) INSTALLAZIONE LIBRERIE (solo la primissima volta)
+--------------------------------------
+
+Serve Node.js installato. Per verificare scrivere su CMD: node -v)
+Se non installato, scaricare da 'nodejs.org'
+
+Apri 2 cartelle separate ed esegui npm install in ciascuna:
+
+  cd game_server
+  npm install
+
+  cd ../listener
+  npm install
+
+(la cartella frontend non ha bisogno di npm install, usa librerie da CDN)
+
+npm install legge il file package.json e scarica tutte le
+dipendenze dentro node_modules/. Va rifatto solo se cambia
+il PC o si aggiungono nuove librerie.
+
+
+--------------------------------------
+2) AVVIO DEL PROGETTO (ogni volta che lavori)
+--------------------------------------
+
+Apri 3 terminali separati e lasciali aperti insieme.
+
+TERMINALE 1 - Game Server (il cervello)
+  cd game_server
+  node index.js
+
+  Attendi il messaggio: "Game server attivo su porta 4000"
+
+
+TERMINALE 2 - Frontend (quello che vedrai in OBS/browser)
+  cd frontend
+  npx serve .
+
+  Attendi il messaggio con l'indirizzo, es: "Local: http://localhost:3000"
+  Apri quell'indirizzo su Chrome.
+
+
+TERMINALE 3 - Listener (simulatore per test, oppure TikTok vero)
+
+  Per testare con dati finti:
+  cd listener
+  node simulator.js
+
+  Per collegarsi a una diretta TikTok reale:
+  cd listener
+  node tiktok.js
+
+
+--------------------------------------
+3) ORDINE CONSIGLIATO
+--------------------------------------
+1. Prima il game-server
+2. Poi il frontend
+3. Infine il listener
+
+
+--------------------------------------
+4) COME CHIUDERE TUTTO
+--------------------------------------
+In ogni terminale premere: Ctrl + C
+
+
+--------------------------------------
+RIEPILOGO COMANDI
+--------------------------------------
+Terminale 1: cd game-server  -> node index.js
+Terminale 2: cd frontend     -> npx serve .
+Terminale 3: cd listener     -> node simulator.js  (o node tiktok.js)
