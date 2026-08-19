@@ -1,0 +1,1 @@
+script che legge la chat TikTok/YouTube
